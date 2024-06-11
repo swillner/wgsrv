@@ -49,8 +49,8 @@ ask_user () {
 [[ -n "$PRIVATE_KEY" ]] || PRIVATE_KEY=$(wg genkey)
 [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY=$(wg pubkey <<<"$PRIVATE_KEY")
 
-HOST=${1:?${COLOR_ORANGE}No host given${COLOR_CLEAR}}
-PEER_NAME=${2:?${COLOR_ORANGE}No peer name given${COLOR_CLEAR}}
+HOST=${1:?No host given}
+PEER_NAME=${2:?No peer name given}
 PORT=$(cut -d ':' -f 2 -s <<<"$HOST")
 PORT=${PORT:-52001}
 HOST=$(cut -d ':' -f 1 <<<"$HOST")
