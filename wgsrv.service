@@ -1,0 +1,14 @@
+[Unit]
+Description=WireGuard via wgsrv
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+Documentation=https://github.com/swillner/wgsrv
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wgsrv network up
+ExecStop=/usr/bin/wgsrv network down
+
+[Install]
+WantedBy=multi-user.target
