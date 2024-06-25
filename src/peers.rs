@@ -112,10 +112,9 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
         .iter()
         .map(|p| (p.config.public_key.to_base64(), p))
         .collect::<HashMap<_, _>>();
-    println!("Peers in {}:", network.domain);
     println!(
-        "  {: >16} {: <16} {: <16} {: <16} {: <16} {: <16}",
-        "Latest handshake", "Name", "IPv4", "IPv6", "Sent", "Received"
+        "  {: >13} {: <16} {: <16} {: <16} {: <10} {: <10}",
+        "Handshake", "Name", "IPv4", "IPv6", "Sent", "Received"
     );
     for (name, peer) in network.peers.iter().sorted_by_key(|(_, p)| p.id) {
         let peer_info = peer_infos.get(&peer.public_key.to_base64());
@@ -147,12 +146,12 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
             )
         };
         println!(
-            "  {}{: >16} {: <16} {: <16} {: <16} {: <16} {: <16}{}",
+            "  {}{: >13} {: <16} {: <16} {: <16} {: <10} {: <10}{}",
             color::Fg(state_color.as_ref()),
+            handshake,
             name,
             get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?.ip(),
             get_nth_ip(&IpNetwork::V6(network.net6), peer.id)?.ip(),
-            handshake,
             tx_bytes,
             rx_bytes,
             color::Fg(color::Reset)
