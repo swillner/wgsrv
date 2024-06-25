@@ -3,10 +3,12 @@ use crate::settings::{PeerConf, Settings};
 use clap::Subcommand;
 use ipnetwork::IpNetwork;
 use itertools::Itertools;
+use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
-use wireguard_control::{Backend, DeviceUpdate, Key, PeerConfigBuilder};
+use std::time::SystemTime;
+use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -72,14 +74,74 @@ fn delete(
     Ok(())
 }
 
-fn list(settings: &Settings, network: String) -> Result<(), Box<dyn Error>> {
-    let network = settings.networks.get(&network).ok_or("Unknown network")?;
+fn format_secs(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
+    let network = settings
+        .networks
+        .get(&network_name)
+        .ok_or("Unknown network")?;
+    let wg_interface = network_name.parse()?;
+    let device = Device::get(&wg_interface, Backend::Kernel)?;
+    let now = SystemTime::now();
+    let peer_infos = device
+        .peers
+        .iter()
+        .map(|p| (p.config.public_key.to_base64(), p))
+        .collect::<HashMap<_, _>>();
     println!("Peers in {}:", network.domain);
+    println!(
+        "  {: <16} {: <16} {: <16} {: <16} {: <16} {: <16}",
+        "Name", "IPv4", "IPv6", "Last handshake", "Sent", "Received"
+    );
     for (name, peer) in network.peers.iter().sorted_by_key(|(_, p)| p.id) {
+        let peer_info = peer_infos.get(&peer.public_key.to_base64());
         println!(
-            "  {}: {}",
+            "  {: <16} {: <16} {: <16} {: <16} {: <16} {: <16}",
             name,
-            get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?.ip()
+            get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?.ip(),
+            get_nth_ip(&IpNetwork::V6(network.net6), peer.id)?.ip(),
+            if let Some(peer_info) = peer_info {
+                if let Some(handshake) = peer_info.stats.last_handshake_time {
+                    format_secs(now.duration_since(handshake)?.as_secs())
+                } else {
+                    "-".to_string()
+                }
+            } else {
+                "-".to_string()
+            },
+            if let Some(peer_info) = peer_info {
+                format_bytes(peer_info.stats.tx_bytes)
+            } else {
+                "-".to_string()
+            },
+            if let Some(peer_info) = peer_info {
+                format_bytes(peer_info.stats.rx_bytes)
+            } else {
+                "-".to_string()
+            }
         );
     }
     Ok(())
