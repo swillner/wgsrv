@@ -8,6 +8,7 @@ use std::error::Error;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::time::SystemTime;
+use termion::color;
 use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Subcommand)]
@@ -113,35 +114,48 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
         .collect::<HashMap<_, _>>();
     println!("Peers in {}:", network.domain);
     println!(
-        "  {: <16} {: <16} {: <16} {: <16} {: <16} {: <16}",
-        "Name", "IPv4", "IPv6", "Last handshake", "Sent", "Received"
+        "  {: >16} {: <16} {: <16} {: <16} {: <16} {: <16}",
+        "Latest handshake", "Name", "IPv4", "IPv6", "Sent", "Received"
     );
     for (name, peer) in network.peers.iter().sorted_by_key(|(_, p)| p.id) {
         let peer_info = peer_infos.get(&peer.public_key.to_base64());
+        let (state_color, handshake, tx_bytes, rx_bytes): (
+            Box<dyn color::Color>,
+            String,
+            String,
+            String,
+        ) = if let Some(peer_info) = peer_info {
+            let tx_bytes = format_bytes(peer_info.stats.tx_bytes);
+            let rx_bytes = format_bytes(peer_info.stats.rx_bytes);
+            if let Some(handshake) = peer_info.stats.last_handshake_time {
+                let handshake = now.duration_since(handshake)?.as_secs();
+                let state_color: Box<dyn color::Color> = if handshake > 300 {
+                    Box::new(color::Yellow)
+                } else {
+                    Box::new(color::Green)
+                };
+                (state_color, format_secs(handshake), tx_bytes, rx_bytes)
+            } else {
+                (Box::new(color::Red), "-".to_string(), tx_bytes, rx_bytes)
+            }
+        } else {
+            (
+                Box::new(color::Cyan),
+                "x".to_string(),
+                "".to_string(),
+                "".to_string(),
+            )
+        };
         println!(
-            "  {: <16} {: <16} {: <16} {: <16} {: <16} {: <16}",
+            "  {}{: >16} {: <16} {: <16} {: <16} {: <16} {: <16}{}",
+            color::Fg(state_color.as_ref()),
             name,
             get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?.ip(),
             get_nth_ip(&IpNetwork::V6(network.net6), peer.id)?.ip(),
-            if let Some(peer_info) = peer_info {
-                if let Some(handshake) = peer_info.stats.last_handshake_time {
-                    format_secs(now.duration_since(handshake)?.as_secs())
-                } else {
-                    "-".to_string()
-                }
-            } else {
-                "-".to_string()
-            },
-            if let Some(peer_info) = peer_info {
-                format_bytes(peer_info.stats.tx_bytes)
-            } else {
-                "-".to_string()
-            },
-            if let Some(peer_info) = peer_info {
-                format_bytes(peer_info.stats.rx_bytes)
-            } else {
-                "-".to_string()
-            }
+            handshake,
+            tx_bytes,
+            rx_bytes,
+            color::Fg(color::Reset)
         );
     }
     Ok(())
