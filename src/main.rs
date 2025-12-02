@@ -8,8 +8,9 @@ use clap::{Parser, Subcommand};
 use std::error::Error;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "WireGuard server management tool", long_about = None)]
 struct Cli {
+    /// Path to the settings file
     #[arg(long, default_value = "/etc/wireguard/wgsrv.json")]
     settings: String,
 
@@ -19,10 +20,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage WireGuard networks
+    #[command(visible_alias = "net")]
     Network {
         #[command(subcommand)]
         command: networks::Command,
     },
+    /// Manage peers in a network
     Peer {
         #[command(subcommand)]
         command: peers::Command,

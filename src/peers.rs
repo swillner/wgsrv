@@ -13,28 +13,41 @@ use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Delete a peer from a network
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Name of the network
         #[arg()]
         network: String,
 
+        /// Name of the peer to delete
         #[arg()]
         peer: String,
     },
+    /// List all peers in a network with their status
+    #[command(visible_alias = "ls")]
     List {
+        /// Name of the network
         #[arg()]
         network: String,
     },
+    /// Start registration server for new peers
     Register {
+        /// Name of the network to register peers in
         #[arg()]
         network: String,
 
+        /// Address and port to listen on for peer connections
         #[arg(long, default_value = "0.0.0.0:52001")]
         listen: SocketAddr,
     },
+    /// Show details of a specific peer
     Show {
+        /// Name of the network
         #[arg()]
         network: String,
 
+        /// Name of the peer to show
         #[arg()]
         peer: String,
     },

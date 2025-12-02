@@ -15,33 +15,49 @@ use wireguard_control::{Backend, DeviceUpdate, KeyPair, PeerConfigBuilder};
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Create a new WireGuard network
     Add {
+        /// Name of the network (used as interface name)
         #[arg()]
         name: String,
 
+        /// IPv4 network in CIDR notation (e.g., 10.0.0.0/24)
         #[arg(long)]
         net4: Ipv4Network,
 
+        /// IPv6 network in CIDR notation (e.g., fd00::/64)
         #[arg(long)]
         net6: Ipv6Network,
 
+        /// UDP port for WireGuard to listen on
         #[arg()]
         port: u16,
     },
+    /// Delete an existing network
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Name of the network to delete
         #[arg()]
         name: String,
     },
+    /// Bring network(s) down
     Down {
+        /// Network name (if omitted, all networks are brought down)
         #[arg()]
         name: Option<String>,
     },
+    /// List all configured networks
+    #[command(visible_alias = "ls")]
     List,
+    /// Show details of a specific network
     Show {
+        /// Name of the network to show
         #[arg()]
         name: String,
     },
+    /// Bring network(s) up
     Up {
+        /// Network name (if omitted, all networks are brought up)
         #[arg()]
         name: Option<String>,
     },
