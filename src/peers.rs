@@ -1,8 +1,9 @@
-use crate::helpers::{get_nth_ip, user_confirm};
+use crate::helpers::{get_nth_ip, unknown_network_error, unknown_peer_error, user_confirm};
 use crate::settings::{PeerConf, Settings};
 use clap::Subcommand;
 use ipnetwork::IpNetwork;
 use itertools::Itertools;
+use log::info;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -13,28 +14,41 @@ use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Delete a peer from a network
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Name of the network
         #[arg()]
         network: String,
 
+        /// Name of the peer to delete
         #[arg()]
         peer: String,
     },
+    /// List all peers in a network with their status
+    #[command(visible_alias = "ls")]
     List {
+        /// Name of the network
         #[arg()]
         network: String,
     },
+    /// Start registration server for new peers
     Register {
+        /// Name of the network to register peers in
         #[arg()]
         network: String,
 
+        /// Address and port to listen on for peer connections
         #[arg(long, default_value = "0.0.0.0:52001")]
         listen: SocketAddr,
     },
+    /// Show details of a specific peer
     Show {
+        /// Name of the network
         #[arg()]
         network: String,
 
+        /// Name of the peer to show
         #[arg()]
         peer: String,
     },
@@ -42,11 +56,17 @@ pub enum Command {
 
 impl Command {
     pub fn run(self, settings: Settings) -> Result<(), Box<dyn Error>> {
+        let available_networks: Vec<String> = settings.networks.keys().cloned().collect();
+
         match self {
-            Command::Delete { network, peer } => delete(settings, network, peer),
-            Command::List { network } => list(&settings, network),
-            Command::Register { network, listen } => register(settings, network, listen),
-            Command::Show { network, peer } => show(&settings, network, peer),
+            Command::Delete { network, peer } => {
+                delete(settings, network, peer, &available_networks)
+            }
+            Command::List { network } => list(&settings, network, &available_networks),
+            Command::Register { network, listen } => {
+                register(settings, network, listen, &available_networks)
+            }
+            Command::Show { network, peer } => show(&settings, network, peer, &available_networks),
         }
     }
 }
@@ -55,12 +75,17 @@ fn delete(
     mut settings: Settings,
     network_name: String,
     peer_name: String,
+    available_networks: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
         .get_mut(&network_name)
-        .ok_or("Unknown network")?;
-    let peer = network.peers.remove(&peer_name).ok_or("Unknown peer")?;
+        .ok_or_else(|| unknown_network_error(&network_name, available_networks))?;
+    let available_peers: Vec<String> = network.peers.keys().cloned().collect();
+    let peer = network
+        .peers
+        .remove(&peer_name)
+        .ok_or_else(|| unknown_peer_error(&peer_name, &network_name, &available_peers))?;
     if user_confirm(&format!(
         "Delete peer {} with public key {}?",
         peer_name,
@@ -99,11 +124,15 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
+fn list(
+    settings: &Settings,
+    network_name: String,
+    available_networks: &[String],
+) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
         .get(&network_name)
-        .ok_or("Unknown network")?;
+        .ok_or_else(|| unknown_network_error(&network_name, available_networks))?;
     let wg_interface = network_name.parse()?;
     let device = Device::get(&wg_interface, Backend::Kernel)?;
     let now = SystemTime::now();
@@ -112,10 +141,14 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
         .iter()
         .map(|p| (p.config.public_key.to_base64(), p))
         .collect::<HashMap<_, _>>();
+
+    // Table header
     println!(
-        "  {: >13} {: <16} {: <16} {: <16} {: <10} {: <10}",
+        "{:>13}  {:16}  {:16}  {:39}  {:>10}  {:>10}",
         "Handshake", "Name", "IPv4", "IPv6", "Sent", "Received"
     );
+    println!("{}", "-".repeat(113));
+
     for (name, peer) in network.peers.iter().sorted_by_key(|(_, p)| p.id) {
         let peer_info = peer_infos.get(&peer.public_key.to_base64());
         let (state_color, handshake, tx_bytes, rx_bytes): (
@@ -140,13 +173,13 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
         } else {
             (
                 Box::new(color::Cyan),
-                "x".to_string(),
-                "".to_string(),
-                "".to_string(),
+                "(not active)".to_string(),
+                "-".to_string(),
+                "-".to_string(),
             )
         };
         println!(
-            "  {}{: >13} {: <16} {: <16} {: <16} {: <10} {: <10}{}",
+            "{}{:>13}  {:16}  {:16}  {:39}  {:>10}  {:>10}{}",
             color::Fg(state_color.as_ref()),
             handshake,
             name,
@@ -164,16 +197,17 @@ fn register(
     mut settings: Settings,
     network_name: String,
     listen: SocketAddr,
+    available_networks: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
         .get_mut(&network_name)
-        .ok_or("Unknown network")?;
+        .ok_or_else(|| unknown_network_error(&network_name, available_networks))?;
     let listener = TcpListener::bind(listen)?;
-    println!("Waiting for peer to connect...");
+    info!("Waiting for peer to connect...");
     match listener.accept() {
         Ok((socket, _addr)) => {
-            println!("Peer connected");
+            info!("Peer connected");
             let mut reader = BufReader::new(socket.try_clone()?);
 
             let peer_name = {
@@ -261,24 +295,22 @@ fn show(
     settings: &Settings,
     network_name: String,
     peer_name: String,
+    available_networks: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
         .get(&network_name)
-        .ok_or("Unknown network")?;
-    let peer = network.peers.get(&peer_name).ok_or("Unknown peer")?;
+        .ok_or_else(|| unknown_network_error(&network_name, available_networks))?;
+    let available_peers: Vec<String> = network.peers.keys().cloned().collect();
+    let peer = network
+        .peers
+        .get(&peer_name)
+        .ok_or_else(|| unknown_peer_error(&peer_name, &network_name, &available_peers))?;
     let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?;
     let ip6 = get_nth_ip(&IpNetwork::V6(network.net6), peer.id)?;
-    println!(
-        "Peer {} in {}:
-  Public key: {}
-  IPv4: {}
-  IPv6: {}",
-        peer_name,
-        network.domain,
-        peer.public_key.to_base64(),
-        ip4.ip(),
-        ip6.ip()
-    );
+    info!("Peer {} in {}:", peer_name, network.domain);
+    info!("  Public key: {}", peer.public_key.to_base64());
+    info!("  IPv4: {}", ip4.ip());
+    info!("  IPv6: {}", ip6.ip());
     Ok(())
 }

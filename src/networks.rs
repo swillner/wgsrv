@@ -1,4 +1,4 @@
-use crate::helpers::{get_nth_ip, user_confirm};
+use crate::helpers::{get_nth_ip, unknown_network_error, user_confirm};
 use crate::settings::{NetworkConf, Settings};
 use clap::Subcommand;
 use futures::{future, stream::TryStreamExt};
@@ -10,38 +10,53 @@ use rtnetlink::IpVersion;
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
-use std::net::IpAddr;
 use wireguard_control::{Backend, DeviceUpdate, KeyPair, PeerConfigBuilder};
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Create a new WireGuard network
     Add {
+        /// Name of the network (used as interface name)
         #[arg()]
         name: String,
 
+        /// IPv4 network in CIDR notation (e.g., 10.0.0.0/24)
         #[arg(long)]
         net4: Ipv4Network,
 
+        /// IPv6 network in CIDR notation (e.g., fd00::/64)
         #[arg(long)]
         net6: Ipv6Network,
 
+        /// UDP port for WireGuard to listen on
         #[arg()]
         port: u16,
     },
+    /// Delete an existing network
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Name of the network to delete
         #[arg()]
         name: String,
     },
+    /// Bring network(s) down
     Down {
+        /// Network name (if omitted, all networks are brought down)
         #[arg()]
         name: Option<String>,
     },
+    /// List all configured networks
+    #[command(visible_alias = "ls")]
     List,
+    /// Show details of a specific network
     Show {
+        /// Name of the network to show
         #[arg()]
         name: String,
     },
+    /// Bring network(s) up
     Up {
+        /// Network name (if omitted, all networks are brought up)
         #[arg()]
         name: Option<String>,
     },
@@ -49,6 +64,8 @@ pub enum Command {
 
 impl Command {
     pub fn run(self, settings: Settings) -> Result<(), Box<dyn Error>> {
+        let available_networks: Vec<String> = settings.networks.keys().cloned().collect();
+
         match self {
             Command::Add {
                 name,
@@ -56,10 +73,12 @@ impl Command {
                 net6,
                 port,
             } => add(settings, name, net4, net6, port),
-            Command::Delete { name } => delete(settings, &name),
+            Command::Delete { name } => delete(settings, &name, &available_networks),
             Command::Down { name } => with_netlink_handle(|handle| async move {
                 if let Some(name) = name {
-                    settings.networks.get(&name).ok_or("Unknown network")?;
+                    if !settings.networks.contains_key(&name) {
+                        return Err(unknown_network_error(&name, &available_networks));
+                    }
                     down(&name, &handle).await
                 } else {
                     for (name, _) in &settings.networks {
@@ -69,15 +88,14 @@ impl Command {
                 }
             }),
             Command::List => list(&settings),
-            Command::Show { name } => show(&settings, name),
+            Command::Show { name } => show(&settings, &name, &available_networks),
             Command::Up { name } => with_netlink_handle(|handle| async move {
                 if let Some(name) = name {
-                    up(
-                        &name,
-                        settings.networks.get(&name).ok_or("Unknown network")?,
-                        &handle,
-                    )
-                    .await
+                    let network = settings
+                        .networks
+                        .get(&name)
+                        .ok_or_else(|| unknown_network_error(&name, &available_networks))?;
+                    up(&name, network, &handle).await
                 } else {
                     for (name, network) in &settings.networks {
                         up(&name, network, &handle).await?;
@@ -116,8 +134,10 @@ fn add(
     })
 }
 
-fn delete(mut settings: Settings, name: &String) -> Result<(), Box<dyn Error>> {
-    settings.networks.get(name).ok_or("Unknown network")?;
+fn delete(mut settings: Settings, name: &str, available: &[String]) -> Result<(), Box<dyn Error>> {
+    if !settings.networks.contains_key(name) {
+        return Err(unknown_network_error(name, available));
+    }
     if user_confirm(&format!("Delete network {}?", name)) {
         with_netlink_handle(|handle| async move {
             let iface = Interface::new(name, &handle).await?;
@@ -130,16 +150,16 @@ fn delete(mut settings: Settings, name: &String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn down(name: &String, handle: &rtnetlink::Handle) -> Result<(), Box<dyn Error>> {
+async fn down(name: &str, handle: &rtnetlink::Handle) -> Result<(), Box<dyn Error>> {
     info!("Shutting down network: {}", name);
     let iface = Interface::new(name, handle).await?;
     iface.down().await
 }
 
 fn list(settings: &Settings) -> Result<(), Box<dyn Error>> {
-    println!("Networks:");
+    info!("Networks:");
     for (name, network) in &settings.networks {
-        println!(
+        info!(
             "  {}: {} ({} peers)",
             name,
             network.net4,
@@ -149,16 +169,19 @@ fn list(settings: &Settings) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn show(settings: &Settings, name: String) -> Result<(), Box<dyn Error>> {
-    let network = settings.networks.get(&name).ok_or("Unknown network")?;
-    println!("Network: {}", network.domain);
-    println!("  IPv4: {}", network.net4);
-    println!("  IPv6: {}", network.net6);
-    println!("  Port: {}", network.port);
-    println!("  Private key: {}", network.private_key.to_base64());
-    println!("  Peers:");
+fn show(settings: &Settings, name: &str, available: &[String]) -> Result<(), Box<dyn Error>> {
+    let network = settings
+        .networks
+        .get(name)
+        .ok_or_else(|| unknown_network_error(name, available))?;
+    info!("Network: {}", network.domain);
+    info!("  IPv4: {}", network.net4);
+    info!("  IPv6: {}", network.net6);
+    info!("  Port: {}", network.port);
+    info!("  Private key: {}", network.private_key.to_base64());
+    info!("  Peers:");
     for (name, peer) in network.peers.iter().sorted_by_key(|(_, p)| p.id) {
-        println!(
+        info!(
             "    {}: {}",
             name,
             get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?.ip()
@@ -168,7 +191,7 @@ fn show(settings: &Settings, name: String) -> Result<(), Box<dyn Error>> {
 }
 
 async fn up(
-    name: &String,
+    name: &str,
     network: &NetworkConf,
     handle: &rtnetlink::Handle,
 ) -> Result<(), Box<dyn Error>> {
@@ -224,8 +247,8 @@ fn map_netlink_error(e: rtnetlink::Error) -> Box<dyn Error> {
 }
 
 impl<'a> Interface<'a> {
-    pub async fn new(name: &String, handle: &'a rtnetlink::Handle) -> Result<Self, Box<dyn Error>> {
-        let mut links = handle.link().get().match_name(name.clone()).execute();
+    pub async fn new(name: &str, handle: &'a rtnetlink::Handle) -> Result<Self, Box<dyn Error>> {
+        let mut links = handle.link().get().match_name(name.to_string()).execute();
         if let Some(link) = links.try_next().await.map_err(map_netlink_error)? {
             Ok(Self {
                 index: link.header.index,
@@ -235,11 +258,11 @@ impl<'a> Interface<'a> {
             handle
                 .link()
                 .add()
-                .name(name.clone())
+                .name(name.to_string())
                 .execute()
                 .await
                 .map_err(map_netlink_error)?;
-            let mut links = handle.link().get().match_name(name.clone()).execute();
+            let mut links = handle.link().get().match_name(name.to_string()).execute();
             let link = links
                 .try_next()
                 .await
@@ -333,34 +356,9 @@ impl<'a> Interface<'a> {
             .map_err(map_netlink_error)
     }
 
-    #[allow(dead_code)]
-    pub async fn add_route(&self, ipn: &IpNetwork) -> Result<(), Box<dyn Error>> {
-        let req = self.handle.route().add().output_interface(self.index);
-        match ipn.network() {
-            IpAddr::V4(ip) => req
-                .v4()
-                .destination_prefix(ip, ipn.prefix())
-                .execute()
-                .await
-                .map_err(map_netlink_error),
-            IpAddr::V6(ip) => req
-                .v6()
-                .destination_prefix(ip, ipn.prefix())
-                .execute()
-                .await
-                .map_err(map_netlink_error),
-        }
-    }
-
     pub async fn clear(&self) -> Result<(), Box<dyn Error>> {
         self.delete_routes().await?;
         self.delete_addresses().await
-    }
-
-    #[allow(dead_code)]
-    pub async fn restart(&self, mtu: Option<u32>) -> Result<(), Box<dyn Error>> {
-        self.down().await.ok();
-        self.up(mtu).await
     }
 
     pub async fn delete(&self) -> Result<(), Box<dyn Error>> {
