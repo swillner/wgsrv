@@ -5,6 +5,7 @@ mod settings;
 
 use crate::settings::Settings;
 use clap::{Parser, Subcommand};
+use log::LevelFilter;
 use std::error::Error;
 
 #[derive(Parser)]
@@ -12,6 +13,14 @@ use std::error::Error;
 struct Cli {
     #[arg(long, default_value = "/etc/wireguard/wgsrv.json")]
     settings: String,
+
+    /// Increase verbosity (can be repeated: -v, -vv)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Suppress all output except errors
+    #[arg(short, long)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -40,6 +49,18 @@ impl Command {
 
 fn main() -> Result<(), String> {
     let args = Cli::parse();
+
+    let log_level = if args.quiet {
+        LevelFilter::Error
+    } else {
+        match args.verbose {
+            0 => LevelFilter::Info,
+            1 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        }
+    };
+
+    env_logger::Builder::new().filter_level(log_level).init();
 
     (|| {
         let settings = Settings::from_file(&args.settings)?;
