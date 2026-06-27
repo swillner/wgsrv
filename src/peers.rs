@@ -3,7 +3,7 @@ use crate::settings::{PeerConf, Settings};
 use clap::Subcommand;
 use ipnetwork::IpNetwork;
 use itertools::Itertools;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -107,6 +107,13 @@ fn read_required_line<R: BufRead>(reader: &mut R, field: &str) -> Result<String,
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+fn first_available_peer_id(used_ids: impl IntoIterator<Item = u32>) -> Result<u32, Box<dyn Error>> {
+    let used_ids = used_ids.into_iter().collect::<HashSet<_>>();
+    (2..)
+        .find(|id| !used_ids.contains(id))
+        .ok_or("No more valid slots in network".into())
+}
+
 fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
@@ -200,10 +207,7 @@ fn register(
                 Key::from_base64(&peer_public_key)?
             };
 
-            let used_peer_ids: Vec<u32> = network.peers.values().map(|p| p.id).collect();
-            let peer_id = (2..)
-                .find(|id| !used_peer_ids.contains(id))
-                .ok_or("No more valid slots in network")?;
+            let peer_id = first_available_peer_id(network.peers.values().map(|p| p.id))?;
             let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), peer_id)?;
             let ip6 = get_nth_ip(&IpNetwork::V6(network.net6), peer_id)?;
 
@@ -327,5 +331,15 @@ mod tests {
         let mut reader = Cursor::new("");
 
         assert!(read_required_line(&mut reader, "peer name").is_err());
+    }
+
+    #[test]
+    fn finds_first_available_peer_id_from_two() {
+        assert_eq!(first_available_peer_id([2, 4, 5]).unwrap(), 3);
+    }
+
+    #[test]
+    fn uses_two_when_no_peer_ids_are_used() {
+        assert_eq!(first_available_peer_id([]).unwrap(), 2);
     }
 }
