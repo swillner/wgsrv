@@ -213,7 +213,7 @@ fn register(
                 return Err("User cancelled".into());
             }
 
-            let public_key = network.private_key.generate_public();
+            let public_key = network.private_key.get_public();
             write!(
                 BufWriter::new(socket.try_clone()?),
                 "[Interface]

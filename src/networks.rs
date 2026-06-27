@@ -5,12 +5,12 @@ use futures::{future, stream::TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use itertools::Itertools;
 use log::info;
-use netlink_packet_route::route::RouteAttribute;
-use rtnetlink::IpVersion;
+use rtnetlink::packet_route::route::RouteAttribute;
+use rtnetlink::{IpVersion, LinkUnspec, LinkWireguard, RouteMessageBuilder};
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use wireguard_control::{Backend, DeviceUpdate, KeyPair, PeerConfigBuilder};
 
 #[derive(Subcommand)]
@@ -62,8 +62,8 @@ impl Command {
                     settings.networks.get(&name).ok_or("Unknown network")?;
                     down(&name, &handle).await
                 } else {
-                    for (name, _) in &settings.networks {
-                        down(&name, &handle).await?;
+                    for name in settings.networks.keys() {
+                        down(name, &handle).await?;
                     }
                     Ok(())
                 }
@@ -80,7 +80,7 @@ impl Command {
                     .await
                 } else {
                     for (name, network) in &settings.networks {
-                        up(&name, network, &handle).await?;
+                        up(name, network, &handle).await?;
                     }
                     Ok(())
                 }
@@ -130,7 +130,7 @@ fn delete(mut settings: Settings, name: &String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn down(name: &String, handle: &rtnetlink::Handle) -> Result<(), Box<dyn Error>> {
+async fn down(name: &str, handle: &rtnetlink::Handle) -> Result<(), Box<dyn Error>> {
     info!("Shutting down network: {}", name);
     let iface = Interface::new(name, handle).await?;
     iface.down().await
@@ -168,7 +168,7 @@ fn show(settings: &Settings, name: String) -> Result<(), Box<dyn Error>> {
 }
 
 async fn up(
-    name: &String,
+    name: &str,
     network: &NetworkConf,
     handle: &rtnetlink::Handle,
 ) -> Result<(), Box<dyn Error>> {
@@ -176,7 +176,7 @@ async fn up(
     let wg_interface = name.parse()?;
     let mut update = DeviceUpdate::new()
         .set_private_key(network.private_key.clone())
-        .set_public_key(network.private_key.generate_public())
+        .set_public_key(network.private_key.get_public())
         .set_listen_port(network.port)
         .replace_peers();
     for (peer_name, peer) in &network.peers {
@@ -224,8 +224,8 @@ fn map_netlink_error(e: rtnetlink::Error) -> Box<dyn Error> {
 }
 
 impl<'a> Interface<'a> {
-    pub async fn new(name: &String, handle: &'a rtnetlink::Handle) -> Result<Self, Box<dyn Error>> {
-        let mut links = handle.link().get().match_name(name.clone()).execute();
+    pub async fn new(name: &str, handle: &'a rtnetlink::Handle) -> Result<Self, Box<dyn Error>> {
+        let mut links = handle.link().get().match_name(name.to_owned()).execute();
         if let Some(link) = links.try_next().await.map_err(map_netlink_error)? {
             Ok(Self {
                 index: link.header.index,
@@ -234,12 +234,11 @@ impl<'a> Interface<'a> {
         } else {
             handle
                 .link()
-                .add()
-                .name(name.clone())
+                .add(LinkWireguard::new(name).build())
                 .execute()
                 .await
                 .map_err(map_netlink_error)?;
-            let mut links = handle.link().get().match_name(name.clone()).execute();
+            let mut links = handle.link().get().match_name(name.to_owned()).execute();
             let link = links
                 .try_next()
                 .await
@@ -255,27 +254,35 @@ impl<'a> Interface<'a> {
     pub async fn down(&self) -> Result<(), Box<dyn Error>> {
         self.handle
             .link()
-            .set(self.index)
-            .down()
+            .change(LinkUnspec::new_with_index(self.index).down().build())
             .execute()
             .await
             .map_err(map_netlink_error)
     }
 
     pub async fn up(&self, mtu: Option<u32>) -> Result<(), Box<dyn Error>> {
-        let mut req = self.handle.link().set(self.index);
+        let mut link = LinkUnspec::new_with_index(self.index).up();
         if let Some(mtu) = mtu {
-            req = req.mtu(mtu);
+            link = link.mtu(mtu);
         }
-        req.up().execute().await.map_err(map_netlink_error)
+        self.handle
+            .link()
+            .change(link.build())
+            .execute()
+            .await
+            .map_err(map_netlink_error)
     }
 
     pub async fn delete_routes(&self) -> Result<(), Box<dyn Error>> {
         for version in [IpVersion::V4, IpVersion::V6] {
+            let route = match version {
+                IpVersion::V4 => RouteMessageBuilder::<Ipv4Addr>::new().build(),
+                IpVersion::V6 => RouteMessageBuilder::<Ipv6Addr>::new().build(),
+            };
             let routes = self
                 .handle
                 .route()
-                .get(version)
+                .get(route)
                 .execute()
                 .try_filter(|route| {
                     future::ready(
@@ -335,21 +342,22 @@ impl<'a> Interface<'a> {
 
     #[allow(dead_code)]
     pub async fn add_route(&self, ipn: &IpNetwork) -> Result<(), Box<dyn Error>> {
-        let req = self.handle.route().add().output_interface(self.index);
-        match ipn.network() {
-            IpAddr::V4(ip) => req
-                .v4()
+        let route = match ipn.network() {
+            IpAddr::V4(ip) => RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(ip, ipn.prefix())
-                .execute()
-                .await
-                .map_err(map_netlink_error),
-            IpAddr::V6(ip) => req
-                .v6()
+                .output_interface(self.index)
+                .build(),
+            IpAddr::V6(ip) => RouteMessageBuilder::<Ipv6Addr>::new()
                 .destination_prefix(ip, ipn.prefix())
-                .execute()
-                .await
-                .map_err(map_netlink_error),
-        }
+                .output_interface(self.index)
+                .build(),
+        };
+        self.handle
+            .route()
+            .add(route)
+            .execute()
+            .await
+            .map_err(map_netlink_error)
     }
 
     pub async fn clear(&self) -> Result<(), Box<dyn Error>> {
