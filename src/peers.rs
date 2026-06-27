@@ -99,6 +99,14 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn read_required_line<R: BufRead>(reader: &mut R, field: &str) -> Result<String, Box<dyn Error>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(format!("Missing {}", field).into());
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
@@ -177,9 +185,7 @@ fn register(
             let mut reader = BufReader::new(socket.try_clone()?);
 
             let peer_name = {
-                let mut peer_name = String::new();
-                reader.read_line(&mut peer_name)?;
-                peer_name.pop(); // remove newline
+                let peer_name = read_required_line(&mut reader, "peer name")?;
                 if peer_name.len() < 3 {
                     return Err("Invalid peer name".into());
                 }
@@ -190,9 +196,7 @@ fn register(
             };
 
             let peer_public_key = {
-                let mut peer_public_key = String::new();
-                reader.read_line(&mut peer_public_key)?;
-                peer_public_key.pop(); // remove newline
+                let peer_public_key = read_required_line(&mut reader, "peer public key")?;
                 Key::from_base64(&peer_public_key)?
             };
 
@@ -281,4 +285,47 @@ fn show(
         ip6.ip()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_lf_terminated_line() {
+        let mut reader = Cursor::new("peer\n");
+
+        assert_eq!(
+            read_required_line(&mut reader, "peer name").unwrap(),
+            "peer"
+        );
+    }
+
+    #[test]
+    fn reads_crlf_terminated_line() {
+        let mut reader = Cursor::new("peer\r\n");
+
+        assert_eq!(
+            read_required_line(&mut reader, "peer name").unwrap(),
+            "peer"
+        );
+    }
+
+    #[test]
+    fn keeps_eof_terminated_line_intact() {
+        let mut reader = Cursor::new("peer");
+
+        assert_eq!(
+            read_required_line(&mut reader, "peer name").unwrap(),
+            "peer"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_required_line() {
+        let mut reader = Cursor::new("");
+
+        assert!(read_required_line(&mut reader, "peer name").is_err());
+    }
 }
