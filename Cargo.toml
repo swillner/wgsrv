@@ -4,6 +4,7 @@ authors = ["Sven Willner <sven.willner@gmail.com>"]
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
