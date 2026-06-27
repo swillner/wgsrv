@@ -1,44 +1,63 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 COLOR_ORANGE='\033[0;33m'
 COLOR_LIGHT_GRAY='\033[0;37m'
 COLOR_CLEAR='\033[0m'
 
-get_response () {
-    local question=$1
-    local default_indicator=$2
-    local response
-    if [[ -z "$ALWAYS_ANSWER" ]]
-    then
-        echo -e -n "$COLOR_ORANGE$question$COLOR_CLEAR $COLOR_LIGHT_GRAY$default_indicator$COLOR_CLEAR " > /dev/tty
-        read -r response < /dev/tty
-    else
-        response=$ALWAYS_ANSWER
-    fi
-    echo "$response"
+usage() {
+    printf 'Usage: %s HOST[:PORT] PEER_NAME\n' "${0##*/}" >&2
 }
 
-ask_user () {
+info() {
+    printf '%b%s%b\n' "$COLOR_ORANGE" "$*" "$COLOR_CLEAR" >&2
+}
+
+die() {
+    info "$*"
+    exit 1
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+prompt() {
+    local question=$1
+    local default_value=$2
+    local response
+
+    if [[ ! -t 0 && ! -r /dev/tty ]]; then
+        printf '%s\n' "$default_value"
+        return
+    fi
+
+    printf '%b%s%b %b%s%b ' \
+        "$COLOR_ORANGE" "$question" "$COLOR_CLEAR" \
+        "$COLOR_LIGHT_GRAY" "$default_value" "$COLOR_CLEAR" >/dev/tty
+    read -r response </dev/tty
+    printf '%s\n' "$response"
+}
+
+ask_user() {
     local question=$1
     local default=$2
-    local default_indicator
-    if [[ "$default" = "y" ]]
-    then
-        default_indicator="[Y/n]"
+    local default_indicator response
+
+    if [[ "$default" = "y" ]]; then
+        default_indicator='[Y/n]'
     else
-        default_indicator="[y/N]"
+        default_indicator='[y/N]'
     fi
-    local response
-    response=$(get_response "$question" "$default_indicator")
+
+    response=$(prompt "$question" "$default_indicator")
+
     case $response in
-        [yY][eE][sS]|[yY]|'')
-            if [[ "$default" != "y" && "$response" == "" ]]
-            then
-                return 1
-            else
-                return 0
-            fi
+        [yY] | [yY][eE][sS])
+            return 0
+            ;;
+        '')
+            [[ "$default" = "y" ]]
             ;;
         *)
             return 1
@@ -46,49 +65,134 @@ ask_user () {
     esac
 }
 
-[[ -n "$PRIVATE_KEY" ]] || PRIVATE_KEY=$(wg genkey)
-[[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY=$(wg pubkey <<<"$PRIVATE_KEY")
+parse_host() {
+    local server=$1
 
-HOST=${1:?No host given}
-PEER_NAME=${2:?No peer name given}
-PORT=$(cut -d ':' -f 2 -s <<<"$HOST")
-PORT=${PORT:-52001}
-HOST=$(cut -d ':' -f 1 <<<"$HOST")
-HOST_IP=$(getent ahostsv4 "$HOST" | head -n 1 | cut -d ' ' -f 1)
+    HOST=$server
+    PORT=52001
 
-echo -e "${COLOR_ORANGE}Adding peer $PEER_NAME to $HOST with public key $PUBLIC_KEY - please confirm on server...${COLOR_CLEAR}" >&2
+    if [[ $server =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+        HOST=${BASH_REMATCH[1]}
+        PORT=${BASH_REMATCH[2]}
+    elif [[ $server == *:* && $server != *:*:* ]]; then
+        HOST=${server%:*}
+        PORT=${server##*:}
+    fi
 
-res=$(nc -v "$HOST" "$PORT" <<EOF
-$PEER_NAME
-$PUBLIC_KEY
-EOF
-   )
+    [[ -n "$HOST" ]] || die "Invalid host"
+    [[ $PORT =~ ^[0-9]+$ ]] || die "Invalid port: $PORT"
+    ((PORT > 0 && PORT <= 65535)) || die "Invalid port: $PORT"
+}
 
-if [[ -z "$res" ]]
-then
-    echo -e "${COLOR_ORANGE}An error occured${COLOR_CLEAR}" >&2
-    exit 1
+resolve_endpoint_host() {
+    local host=$1
+    local resolved
+
+    if command -v getent >/dev/null 2>&1; then
+        read -r resolved _ < <(getent ahostsv4 "$host" 2>/dev/null || true) || true
+        if [[ -n "${resolved:-}" ]]; then
+            printf '%s\n' "$resolved"
+            return
+        fi
+    fi
+
+    printf '%s\n' "$host"
+}
+
+register_peer() {
+    local err_file nc_status
+    err_file=$(mktemp)
+
+    if RESPONSE=$(printf '%s\n%s\n' "$PEER_NAME" "$PUBLIC_KEY" | timeout 30 nc "$HOST" "$PORT" 2>"$err_file"); then
+        :
+    else
+        nc_status=$?
+        cat "$err_file" >&2
+        rm -f "$err_file"
+        die "Could not register peer with $HOST:$PORT (exit $nc_status)"
+    fi
+
+    rm -f "$err_file"
+    [[ -n "$RESPONSE" ]] || die "Server returned an empty configuration"
+}
+
+install_config() {
+    local filename=$1
+    local tmp status
+    tmp=$(mktemp)
+
+    printf '%s\n' "$RESPONSE" >"$tmp"
+    if sudo install -m 600 "$tmp" "$filename"; then
+        rm -f "$tmp"
+    else
+        status=$?
+        rm -f "$tmp"
+        return "$status"
+    fi
+}
+
+service_for_config() {
+    local filename=$1
+
+    if [[ $filename == /etc/wireguard/*.conf ]]; then
+        local name=${filename##*/}
+        name=${name%.conf}
+        if [[ $name =~ ^[A-Za-z0-9_.=-]+$ ]]; then
+            printf 'wg-quick@%s.service\n' "$name"
+        fi
+    fi
+}
+
+[[ $# -eq 2 ]] || {
+    usage
+    exit 2
+}
+
+need_command wg
+need_command nc
+need_command sudo
+need_command install
+need_command mktemp
+need_command timeout
+
+parse_host "$1"
+PEER_NAME=$2
+[[ $PEER_NAME != *$'\n'* && $PEER_NAME != *$'\r'* ]] || die "Peer name must be a single line"
+
+if [[ -z "${PRIVATE_KEY:-}" ]]; then
+    PRIVATE_KEY=$(wg genkey)
+fi
+if [[ -z "${PUBLIC_KEY:-}" ]]; then
+    PUBLIC_KEY=$(wg pubkey <<<"$PRIVATE_KEY")
 fi
 
-res="${res//PRIVATE_KEY/$PRIVATE_KEY}"
-res="${res//HOST_IP/$HOST_IP}"
+ENDPOINT_HOST=$(resolve_endpoint_host "$HOST")
 
-echo -e "${COLOR_ORANGE}Received configuration:${COLOR_CLEAR}" >&2
-echo -e "$res"
+info "Adding peer $PEER_NAME to $HOST:$PORT with public key $PUBLIC_KEY - please confirm on server..."
+register_peer
 
-if ask_user "Set as wireguard configuration" "y"
-then
-    if ask_user "Add persistent keepalive?" "n"
-    then
-        res=$(cat <<EOF
-$res
-PersistentKeepalive = 25
-EOF
-           )
+RESPONSE=${RESPONSE//PRIVATE_KEY/$PRIVATE_KEY}
+RESPONSE=${RESPONSE//HOST_IP/$ENDPOINT_HOST}
+
+info "Received configuration:"
+printf '%s\n' "$RESPONSE"
+
+if ask_user "Set as wireguard configuration" "y"; then
+    if ask_user "Add persistent keepalive?" "n"; then
+        RESPONSE="$RESPONSE
+PersistentKeepalive = 25"
     fi
-    default_filename="/etc/wireguard/wg0.conf"
-    filename=$(get_response "Filename for the configuration" "$default_filename")
-    [[ -n "$filename" ]] || filename="$default_filename"
-    echo "$res" | sudo tee "$filename" > /dev/null
-    sudo chmod og-rwx "$filename"
+
+    default_filename='/etc/wireguard/wg0.conf'
+    filename=$(prompt "Filename for the configuration" "$default_filename")
+    [[ -n "$filename" ]] || filename=$default_filename
+
+    install_config "$filename"
+    info "Installed $filename"
+
+    service=$(service_for_config "$filename")
+    if [[ -n "${service:-}" ]] && ask_user "Restart $service" "n"; then
+        need_command systemctl
+        sudo systemctl restart "$service"
+    fi
 fi
