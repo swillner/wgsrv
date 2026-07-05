@@ -1,15 +1,20 @@
 use crate::helpers::{get_nth_ip, user_confirm};
-use crate::settings::{PeerConf, Settings};
+use crate::settings::{NetworkConf, PeerConf, Settings};
 use clap::Subcommand;
 use ipnetwork::IpNetwork;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::time::SystemTime;
 use termion::color;
 use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
+
+const MANUAL_REQUEST_BEGIN: &str = "-----BEGIN WGSRV CLIENT REQUEST-----";
+const MANUAL_REQUEST_END: &str = "-----END WGSRV CLIENT REQUEST-----";
+const MANUAL_CONFIG_BEGIN: &str = "-----BEGIN WGSRV CLIENT CONFIG-----";
+const MANUAL_CONFIG_END: &str = "-----END WGSRV CLIENT CONFIG-----";
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -33,6 +38,9 @@ pub enum Command {
 
         #[arg(long)]
         preshared_key: bool,
+
+        #[arg(long)]
+        manual: bool,
     },
     Show {
         #[arg()]
@@ -52,10 +60,24 @@ impl Command {
                 network,
                 listen,
                 preshared_key,
-            } => register(settings, network, listen, preshared_key),
+                manual,
+            } => register(settings, network, listen, preshared_key, manual),
             Command::Show { network, peer } => show(&settings, network, peer),
         }
     }
+}
+
+struct PendingPeer {
+    name: String,
+    public_key: Key,
+    id: u32,
+    ip4: IpNetwork,
+    ip6: IpNetwork,
+}
+
+struct ManualClientRequest {
+    peer_name: String,
+    public_key: Key,
 }
 
 fn delete(
@@ -114,11 +136,121 @@ fn read_required_line<R: BufRead>(reader: &mut R, field: &str) -> Result<String,
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+fn read_manual_request_block<R: BufRead>(reader: &mut R) -> Result<String, Box<dyn Error>> {
+    let mut block = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        block.push_str(&line);
+        if line.trim_end_matches(['\r', '\n']) == MANUAL_REQUEST_END {
+            return Ok(block);
+        }
+    }
+    Err("Missing end marker in client request".into())
+}
+
+fn parse_manual_request_block(block: &str) -> Result<ManualClientRequest, Box<dyn Error>> {
+    let mut lines = block.lines().map(str::trim);
+    if lines.next() != Some(MANUAL_REQUEST_BEGIN) {
+        return Err("Missing begin marker in client request".into());
+    }
+
+    let mut peer_name = None;
+    let mut public_key = None;
+    let mut found_end = false;
+    for line in lines {
+        if line == MANUAL_REQUEST_END {
+            found_end = true;
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Name:") {
+            peer_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("PublicKey:") {
+            public_key = Some(Key::from_base64(value.trim())?);
+        }
+    }
+    if !found_end {
+        return Err("Missing end marker in client request".into());
+    }
+
+    Ok(ManualClientRequest {
+        peer_name: peer_name.ok_or("Missing peer name in client request")?,
+        public_key: public_key.ok_or("Missing public key in client request")?,
+    })
+}
+
 fn first_available_peer_id(used_ids: impl IntoIterator<Item = u32>) -> Result<u32, Box<dyn Error>> {
     let used_ids = used_ids.into_iter().collect::<HashSet<_>>();
     (2..)
         .find(|id| !used_ids.contains(id))
         .ok_or("No more valid slots in network".into())
+}
+
+fn prepare_peer(
+    network: &NetworkConf,
+    peer_name: String,
+    public_key: Key,
+) -> Result<PendingPeer, Box<dyn Error>> {
+    if peer_name.len() < 3 {
+        return Err("Invalid peer name".into());
+    }
+    if network.peers.contains_key(&peer_name) {
+        return Err("Peer already registered".into());
+    }
+
+    let id = first_available_peer_id(network.peers.values().map(|p| p.id))?;
+    Ok(PendingPeer {
+        name: peer_name,
+        public_key,
+        id,
+        ip4: get_nth_ip(&IpNetwork::V4(network.net4), id)?,
+        ip6: get_nth_ip(&IpNetwork::V6(network.net6), id)?,
+    })
+}
+
+fn confirm_peer_registration(peer: &PendingPeer) -> Result<(), Box<dyn Error>> {
+    if user_confirm(&format!(
+        "Register peer {} with public key {} with ips {} and {}?",
+        peer.name,
+        peer.public_key.to_base64(),
+        peer.ip4.ip(),
+        peer.ip6.ip(),
+    )) {
+        Ok(())
+    } else {
+        Err("User cancelled".into())
+    }
+}
+
+fn apply_peer(
+    network_name: &str,
+    network: &mut NetworkConf,
+    peer: PendingPeer,
+    preshared_key: Option<Key>,
+) -> Result<(), Box<dyn Error>> {
+    let wg_interface = network_name.parse()?;
+    let mut peer_config = PeerConfigBuilder::new(&peer.public_key)
+        .replace_allowed_ips()
+        .add_allowed_ip(peer.ip4.ip(), 32)
+        .add_allowed_ip(peer.ip6.ip(), 128);
+    if let Some(key) = &preshared_key {
+        peer_config = peer_config.set_preshared_key(key.clone());
+    }
+    DeviceUpdate::new()
+        .add_peer(peer_config)
+        .apply(&wg_interface, Backend::Kernel)?;
+
+    network.peers.insert(
+        peer.name,
+        PeerConf {
+            public_key: peer.public_key,
+            preshared_key,
+            id: peer.id,
+        },
+    );
+    Ok(())
 }
 
 fn render_client_config(
@@ -152,6 +284,10 @@ Endpoint = HOST_IP:{}
         network6,
         port,
     )
+}
+
+fn render_manual_config_block(config: &str) -> String {
+    format!("{MANUAL_CONFIG_BEGIN}\n{config}{MANUAL_CONFIG_END}\n")
 }
 
 fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
@@ -216,6 +352,20 @@ fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>>
 }
 
 fn register(
+    settings: Settings,
+    network_name: String,
+    listen: SocketAddr,
+    use_preshared_key: bool,
+    manual: bool,
+) -> Result<(), Box<dyn Error>> {
+    if manual {
+        register_manual(settings, network_name, use_preshared_key)
+    } else {
+        register_tcp(settings, network_name, listen, use_preshared_key)
+    }
+}
+
+fn register_tcp(
     mut settings: Settings,
     network_name: String,
     listen: SocketAddr,
@@ -232,43 +382,24 @@ fn register(
             println!("Peer connected");
             let mut reader = BufReader::new(socket.try_clone()?);
 
-            let peer_name = {
-                let peer_name = read_required_line(&mut reader, "peer name")?;
-                if peer_name.len() < 3 {
-                    return Err("Invalid peer name".into());
-                }
-                if network.peers.contains_key(&peer_name) {
-                    return Err("Peer already registered".into());
-                }
-                peer_name
-            };
+            let peer_name = read_required_line(&mut reader, "peer name")?;
 
             let peer_public_key = {
                 let peer_public_key = read_required_line(&mut reader, "peer public key")?;
                 Key::from_base64(&peer_public_key)?
             };
 
-            let peer_id = first_available_peer_id(network.peers.values().map(|p| p.id))?;
-            let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), peer_id)?;
-            let ip6 = get_nth_ip(&IpNetwork::V6(network.net6), peer_id)?;
+            let peer = prepare_peer(network, peer_name, peer_public_key)?;
             let preshared_key = use_preshared_key.then(Key::generate_preshared);
 
-            if !user_confirm(&format!(
-                "Register peer {} with public key {} with ips {} and {}?",
-                peer_name,
-                peer_public_key.to_base64(),
-                ip4.ip(),
-                ip6.ip(),
-            )) {
-                return Err("User cancelled".into());
-            }
+            confirm_peer_registration(&peer)?;
 
             let preshared_key_for_client = if let Some(key) = &preshared_key {
                 if user_confirm("Send preshared key over the unencrypted registration connection?")
                 {
                     Some(key.to_base64())
                 } else {
-                    println!("Preshared key for {}: {}", peer_name, key.to_base64());
+                    println!("Preshared key for {}: {}", peer.name, key.to_base64());
                     println!("Copy this key to the client out of band.");
                     Some("PRESHARED_KEY".to_string())
                 }
@@ -278,8 +409,8 @@ fn register(
 
             let public_key = network.private_key.get_public();
             let config = render_client_config(
-                &ip4,
-                &ip6,
+                &peer.ip4,
+                &peer.ip6,
                 &public_key,
                 &IpNetwork::V4(network.net4),
                 &IpNetwork::V6(network.net6),
@@ -288,31 +419,56 @@ fn register(
             );
             BufWriter::new(socket.try_clone()?).write_all(config.as_bytes())?;
 
-            let wg_interface = network_name.parse()?;
-            let mut peer = PeerConfigBuilder::new(&peer_public_key)
-                .replace_allowed_ips()
-                .add_allowed_ip(ip4.ip(), 32)
-                .add_allowed_ip(ip6.ip(), 128);
-            if let Some(key) = &preshared_key {
-                peer = peer.set_preshared_key(key.clone());
-            }
-            DeviceUpdate::new()
-                .add_peer(peer)
-                .apply(&wg_interface, Backend::Kernel)?;
-
-            network.peers.insert(
-                peer_name,
-                PeerConf {
-                    public_key: peer_public_key,
-                    preshared_key,
-                    id: peer_id,
-                },
-            );
-
+            apply_peer(&network_name, network, peer, preshared_key)?;
             settings.persist()
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn register_manual(
+    mut settings: Settings,
+    network_name: String,
+    use_preshared_key: bool,
+) -> Result<(), Box<dyn Error>> {
+    settings
+        .networks
+        .get(&network_name)
+        .ok_or("Unknown network")?;
+
+    println!("Paste client request block, ending with {MANUAL_REQUEST_END}:");
+    let stdin = io::stdin();
+    let block = read_manual_request_block(&mut stdin.lock())?;
+    let request = parse_manual_request_block(&block)?;
+
+    let network = settings
+        .networks
+        .get_mut(&network_name)
+        .ok_or("Unknown network")?;
+    let peer = prepare_peer(network, request.peer_name, request.public_key)?;
+    let preshared_key = use_preshared_key.then(Key::generate_preshared);
+
+    confirm_peer_registration(&peer)?;
+
+    let preshared_key_for_client = preshared_key.as_ref().map(Key::to_base64);
+    let public_key = network.private_key.get_public();
+    let config = render_client_config(
+        &peer.ip4,
+        &peer.ip6,
+        &public_key,
+        &IpNetwork::V4(network.net4),
+        &IpNetwork::V6(network.net6),
+        network.port,
+        preshared_key_for_client.as_deref(),
+    );
+
+    apply_peer(&network_name, network, peer, preshared_key)?;
+    settings.persist()?;
+
+    println!("Copy this config block back to the client:");
+    print!("{}", render_manual_config_block(&config));
+    io::stdout().flush()?;
+    Ok(())
 }
 
 fn show(
@@ -409,5 +565,35 @@ mod tests {
         );
 
         assert!(config.contains("PresharedKey = PRESHARED_KEY\n"));
+    }
+
+    #[test]
+    fn parses_manual_client_request_block() {
+        let block = format!(
+            "{MANUAL_REQUEST_BEGIN}\nName: laptop\nPublicKey: {}\n{MANUAL_REQUEST_END}\n",
+            Key::zero().to_base64()
+        );
+
+        let request = parse_manual_request_block(&block).unwrap();
+
+        assert_eq!(request.peer_name, "laptop");
+        assert_eq!(request.public_key.to_base64(), Key::zero().to_base64());
+    }
+
+    #[test]
+    fn rejects_manual_client_request_without_public_key() {
+        let block = format!("{MANUAL_REQUEST_BEGIN}\nName: laptop\n{MANUAL_REQUEST_END}\n");
+
+        assert!(parse_manual_request_block(&block).is_err());
+    }
+
+    #[test]
+    fn renders_manual_config_block_without_changing_config_body() {
+        let config = "[Interface]\nPrivateKey = PRIVATE_KEY\n";
+
+        assert_eq!(
+            render_manual_config_block(config),
+            format!("{MANUAL_CONFIG_BEGIN}\n{config}{MANUAL_CONFIG_END}\n")
+        );
     }
 }

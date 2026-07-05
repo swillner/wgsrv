@@ -105,6 +105,20 @@ the peer name and public key to the server, and prints the returned config. The
 server registers the peer during that exchange and sends back the addresses,
 server public key, endpoint, and allowed IPs. No manual copy/paste is needed.
 
+If the client cannot connect to the registration port, use manual mode instead.
+It avoids the temporary registration connection entirely and uses two clear
+copy/paste blocks:
+
+```sh
+sudo wgsrv peer register --manual wg0
+scripts/register-client.sh --manual server.example.org laptop
+```
+
+The client script prints a request block with the peer name and public key.
+Paste that on the server. The server registers the peer and prints a config
+block to paste back on the client. With `--preshared-key`, manual mode includes
+the actual preshared key in that copied config block.
+
 If you choose to install the config, the script writes it with mode `600`. For
 configs under `/etc/wireguard/*.conf`, it can also restart the matching
 `wg-quick@...` systemd service.

@@ -4,9 +4,13 @@ set -euo pipefail
 COLOR_ORANGE='\033[0;33m'
 COLOR_LIGHT_GRAY='\033[0;37m'
 COLOR_CLEAR='\033[0m'
+MANUAL_REQUEST_BEGIN='-----BEGIN WGSRV CLIENT REQUEST-----'
+MANUAL_REQUEST_END='-----END WGSRV CLIENT REQUEST-----'
+MANUAL_CONFIG_BEGIN='-----BEGIN WGSRV CLIENT CONFIG-----'
+MANUAL_CONFIG_END='-----END WGSRV CLIENT CONFIG-----'
 
 usage() {
-    printf 'Usage: %s HOST[:PORT] PEER_NAME\n' "${0##*/}" >&2
+    printf 'Usage: %s [--manual] HOST[:PORT] PEER_NAME\n' "${0##*/}" >&2
 }
 
 info() {
@@ -101,6 +105,9 @@ resolve_endpoint_host() {
 
 register_peer() {
     local err_file nc_status
+    need_command nc
+    need_command timeout
+
     err_file=$(mktemp)
 
     if RESPONSE=$(printf '%s\n%s\n' "$PEER_NAME" "$PUBLIC_KEY" | timeout 30 nc "$HOST" "$PORT" 2>"$err_file"); then
@@ -116,9 +123,50 @@ register_peer() {
     [[ -n "$RESPONSE" ]] || die "Server returned an empty configuration"
 }
 
+read_until_marker() {
+    local end_marker=$1
+    local block='' line
+    local input=/dev/stdin
+
+    if [[ -r /dev/tty ]]; then
+        input=/dev/tty
+    fi
+
+    while IFS= read -r line; do
+        line=${line%$'\r'}
+        block+="$line"$'\n'
+        if [[ $line == "$end_marker" ]]; then
+            printf '%s' "$block"
+            return
+        fi
+    done <"$input"
+
+    die "Missing end marker: $end_marker"
+}
+
+manual_register_peer() {
+    info "Copy this request block to the server:"
+    printf '%s\n' "$MANUAL_REQUEST_BEGIN"
+    printf 'Name: %s\n' "$PEER_NAME"
+    printf 'PublicKey: %s\n' "$PUBLIC_KEY"
+    printf '%s\n' "$MANUAL_REQUEST_END"
+
+    info "Paste server config block, ending with $MANUAL_CONFIG_END:"
+    RESPONSE=$(read_until_marker "$MANUAL_CONFIG_END")
+
+    [[ $RESPONSE == *"$MANUAL_CONFIG_BEGIN"* ]] || die "Missing config begin marker"
+    [[ $RESPONSE == *"$MANUAL_CONFIG_END"* ]] || die "Missing config end marker"
+    RESPONSE=${RESPONSE#*"$MANUAL_CONFIG_BEGIN"$'\n'}
+    RESPONSE=${RESPONSE%"$MANUAL_CONFIG_END"$'\n'}
+    [[ -n "$RESPONSE" ]] || die "Server returned an empty configuration"
+}
+
 install_config() {
     local filename=$1
     local tmp status
+    need_command sudo
+    need_command install
+
     tmp=$(mktemp)
 
     printf '%s\n' "$RESPONSE" >"$tmp"
@@ -143,17 +191,19 @@ service_for_config() {
     fi
 }
 
+MANUAL=false
+if [[ ${1:-} == "--manual" ]]; then
+    MANUAL=true
+    shift
+fi
+
 [[ $# -eq 2 ]] || {
     usage
     exit 2
 }
 
 need_command wg
-need_command nc
-need_command sudo
-need_command install
 need_command mktemp
-need_command timeout
 
 parse_host "$1"
 PEER_NAME=$2
@@ -168,8 +218,13 @@ fi
 
 ENDPOINT_HOST=$(resolve_endpoint_host "$HOST")
 
-info "Adding peer $PEER_NAME to $HOST:$PORT with public key $PUBLIC_KEY - please confirm on server..."
-register_peer
+if [[ $MANUAL == true ]]; then
+    info "Adding peer $PEER_NAME to $HOST:$PORT manually with public key $PUBLIC_KEY"
+    manual_register_peer
+else
+    info "Adding peer $PEER_NAME to $HOST:$PORT with public key $PUBLIC_KEY - please confirm on server..."
+    register_peer
+fi
 
 RESPONSE=${RESPONSE//PRIVATE_KEY/$PRIVATE_KEY}
 RESPONSE=${RESPONSE//HOST_IP/$ENDPOINT_HOST}
