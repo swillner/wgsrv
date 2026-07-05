@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wireguard_control::Key;
@@ -56,7 +56,16 @@ pub struct Settings {
 
 impl Settings {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn Error>> {
-        let file = std::fs::File::open(path)?;
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Self {
+                    filename: path.to_string(),
+                    networks: HashMap::new(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
         let reader = BufReader::new(file);
         let mut settings: Self = serde_json::from_reader(reader)?;
         settings.filename = path.to_string();
