@@ -30,6 +30,9 @@ pub enum Command {
 
         #[arg(long, default_value = "0.0.0.0:52001")]
         listen: SocketAddr,
+
+        #[arg(long)]
+        preshared_key: bool,
     },
     Show {
         #[arg()]
@@ -45,7 +48,11 @@ impl Command {
         match self {
             Command::Delete { network, peer } => delete(settings, network, peer),
             Command::List { network } => list(&settings, network),
-            Command::Register { network, listen } => register(settings, network, listen),
+            Command::Register {
+                network,
+                listen,
+                preshared_key,
+            } => register(settings, network, listen, preshared_key),
             Command::Show { network, peer } => show(&settings, network, peer),
         }
     }
@@ -114,6 +121,39 @@ fn first_available_peer_id(used_ids: impl IntoIterator<Item = u32>) -> Result<u3
         .ok_or("No more valid slots in network".into())
 }
 
+fn render_client_config(
+    ip4: &IpNetwork,
+    ip6: &IpNetwork,
+    server_public_key: &Key,
+    network4: &IpNetwork,
+    network6: &IpNetwork,
+    port: u16,
+    preshared_key: Option<&str>,
+) -> String {
+    let preshared_key = preshared_key
+        .map(|key| format!("PresharedKey = {}\n", key))
+        .unwrap_or_default();
+
+    format!(
+        "[Interface]
+Address = {},{}
+MTU = 1280 # otherwise ssh over wireguard hangs
+PrivateKey = PRIVATE_KEY
+
+[Peer]
+PublicKey = {}
+{preshared_key}AllowedIPs = {},{}
+Endpoint = HOST_IP:{}
+",
+        ip4,
+        ip6,
+        server_public_key.to_base64(),
+        network4,
+        network6,
+        port,
+    )
+}
+
 fn list(settings: &Settings, network_name: String) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
@@ -179,6 +219,7 @@ fn register(
     mut settings: Settings,
     network_name: String,
     listen: SocketAddr,
+    use_preshared_key: bool,
 ) -> Result<(), Box<dyn Error>> {
     let network = settings
         .networks
@@ -210,6 +251,7 @@ fn register(
             let peer_id = first_available_peer_id(network.peers.values().map(|p| p.id))?;
             let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), peer_id)?;
             let ip6 = get_nth_ip(&IpNetwork::V6(network.net6), peer_id)?;
+            let preshared_key = use_preshared_key.then(Key::generate_preshared);
 
             if !user_confirm(&format!(
                 "Register peer {} with public key {} with ips {} and {}?",
@@ -221,32 +263,39 @@ fn register(
                 return Err("User cancelled".into());
             }
 
-            let public_key = network.private_key.get_public();
-            write!(
-                BufWriter::new(socket.try_clone()?),
-                "[Interface]
-Address = {},{}
-MTU = 1280 # otherwise ssh over wireguard hangs
-PrivateKey = PRIVATE_KEY
+            let preshared_key_for_client = if let Some(key) = &preshared_key {
+                if user_confirm("Send preshared key over the unencrypted registration connection?")
+                {
+                    Some(key.to_base64())
+                } else {
+                    println!("Preshared key for {}: {}", peer_name, key.to_base64());
+                    println!("Copy this key to the client out of band.");
+                    Some("PRESHARED_KEY".to_string())
+                }
+            } else {
+                None
+            };
 
-[Peer]
-PublicKey = {}
-AllowedIPs = {},{}
-Endpoint = HOST_IP:{}
-",
-                ip4,
-                ip6,
-                public_key.to_base64(),
-                network.net4,
-                network.net6,
-                network.port
-            )?;
+            let public_key = network.private_key.get_public();
+            let config = render_client_config(
+                &ip4,
+                &ip6,
+                &public_key,
+                &IpNetwork::V4(network.net4),
+                &IpNetwork::V6(network.net6),
+                network.port,
+                preshared_key_for_client.as_deref(),
+            );
+            BufWriter::new(socket.try_clone()?).write_all(config.as_bytes())?;
 
             let wg_interface = network_name.parse()?;
-            let peer = PeerConfigBuilder::new(&peer_public_key)
+            let mut peer = PeerConfigBuilder::new(&peer_public_key)
                 .replace_allowed_ips()
                 .add_allowed_ip(ip4.ip(), 32)
                 .add_allowed_ip(ip6.ip(), 128);
+            if let Some(key) = &preshared_key {
+                peer = peer.set_preshared_key(key.clone());
+            }
             DeviceUpdate::new()
                 .add_peer(peer)
                 .apply(&wg_interface, Backend::Kernel)?;
@@ -255,6 +304,7 @@ Endpoint = HOST_IP:{}
                 peer_name,
                 PeerConf {
                     public_key: peer_public_key,
+                    preshared_key,
                     id: peer_id,
                 },
             );
@@ -288,6 +338,9 @@ fn show(
         ip4.ip(),
         ip6.ip()
     );
+    if let Some(preshared_key) = &peer.preshared_key {
+        println!("  Preshared key: {}", preshared_key.to_base64());
+    }
     Ok(())
 }
 
@@ -341,5 +394,20 @@ mod tests {
     #[test]
     fn uses_two_when_no_peer_ids_are_used() {
         assert_eq!(first_available_peer_id([]).unwrap(), 2);
+    }
+
+    #[test]
+    fn renders_client_config_with_preshared_key_placeholder() {
+        let config = render_client_config(
+            &"10.0.0.2/24".parse().unwrap(),
+            &"fd00::2/64".parse().unwrap(),
+            &Key::zero(),
+            &"10.0.0.0/24".parse().unwrap(),
+            &"fd00::/64".parse().unwrap(),
+            51820,
+            Some("PRESHARED_KEY"),
+        );
+
+        assert!(config.contains("PresharedKey = PRESHARED_KEY\n"));
     }
 }

@@ -183,11 +183,14 @@ async fn up(
         let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), peer.id)?;
         let ip6 = get_nth_ip(&IpNetwork::V6(network.net6), peer.id)?;
         info!("Adding peer {}: {} {}", peer_name, ip4, ip6);
-        let peer = PeerConfigBuilder::new(&peer.public_key)
+        let mut peer_config = PeerConfigBuilder::new(&peer.public_key)
             .replace_allowed_ips()
             .add_allowed_ip(ip4.ip(), 32)
             .add_allowed_ip(ip6.ip(), 128);
-        update = update.add_peer(peer);
+        if let Some(preshared_key) = &peer.preshared_key {
+            peer_config = peer_config.set_preshared_key(preshared_key.clone());
+        }
+        update = update.add_peer(peer_config);
     }
     update.apply(&wg_interface, Backend::Kernel)?;
     let ip4 = get_nth_ip(&IpNetwork::V4(network.net4), 1)?;

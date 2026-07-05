@@ -83,6 +83,17 @@ address:
 sudo wgsrv peer register --listen 127.0.0.1:52001 wg0
 ```
 
+If you want a WireGuard preshared key for this client, add
+`--preshared-key`:
+
+```sh
+sudo wgsrv peer register --preshared-key wg0
+```
+
+The server will ask whether to send the preshared key over the registration
+connection. That connection is not encrypted. If you answer no, the server
+prints the key locally and the client script asks you to paste it.
+
 On the client, run:
 
 ```sh

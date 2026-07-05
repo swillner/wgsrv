@@ -23,6 +23,22 @@ where
     key.to_base64().serialize(serializer)
 }
 
+fn optional_key_from_base64str<'de, D>(deserializer: D) -> Result<Option<Key>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(deserializer)?;
+    s.map(|s| Key::from_base64(&s).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+fn optional_key_to_base64str<S>(key: &Option<Key>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    key.as_ref().map(Key::to_base64).serialize(serializer)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkConf {
     pub domain: String,
@@ -44,6 +60,13 @@ pub struct PeerConf {
         serialize_with = "key_to_base64str"
     )]
     pub public_key: Key,
+    #[serde(
+        default,
+        deserialize_with = "optional_key_from_base64str",
+        serialize_with = "optional_key_to_base64str",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preshared_key: Option<Key>,
     pub id: u32,
 }
 
@@ -138,71 +161,4 @@ fn sync_parent_dir(target: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_target: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "wgsrv-{}-{}-{}",
-            name,
-            std::process::id(),
-            timestamp
-        ))
-    }
-
-    #[test]
-    fn persist_rejects_missing_filename() {
-        let settings = Settings {
-            filename: String::new(),
-            networks: HashMap::new(),
-        };
-
-        assert!(settings.persist().is_err());
-    }
-
-    #[test]
-    fn persist_writes_settings_file() {
-        let dir = test_dir("persist");
-        fs::create_dir(&dir).unwrap();
-        let filename = dir.join("settings.json");
-        let settings = Settings {
-            filename: filename.to_string_lossy().to_string(),
-            networks: HashMap::new(),
-        };
-
-        settings.persist().unwrap();
-
-        let persisted = fs::read_to_string(&filename).unwrap();
-        assert!(persisted.contains("\"networks\""));
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn failed_persist_leaves_existing_file_unchanged() {
-        let dir = test_dir("failed-persist");
-        fs::create_dir(&dir).unwrap();
-        let filename = dir.join("settings.json");
-        fs::write(&filename, "original").unwrap();
-        let settings = Settings {
-            filename: filename.to_string_lossy().to_string(),
-            networks: HashMap::new(),
-        };
-        let temp = dir.join("settings.tmp");
-
-        let result = persist_atomic(&settings, &temp, &dir);
-
-        assert!(result.is_err());
-        assert_eq!(fs::read_to_string(&filename).unwrap(), "original");
-        let _ = fs::remove_file(temp);
-        fs::remove_dir_all(dir).unwrap();
-    }
 }

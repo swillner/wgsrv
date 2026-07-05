@@ -173,6 +173,11 @@ register_peer
 
 RESPONSE=${RESPONSE//PRIVATE_KEY/$PRIVATE_KEY}
 RESPONSE=${RESPONSE//HOST_IP/$ENDPOINT_HOST}
+if [[ $RESPONSE == *'PresharedKey = PRESHARED_KEY'* ]]; then
+    PRESHARED_KEY=$(prompt "Preshared key shown on the server" "")
+    [[ -n "$PRESHARED_KEY" ]] || die "Preshared key is required"
+    RESPONSE=${RESPONSE//PRESHARED_KEY/$PRESHARED_KEY}
+fi
 
 info "Received configuration:"
 printf '%s\n' "$RESPONSE"
