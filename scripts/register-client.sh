@@ -156,8 +156,10 @@ manual_register_peer() {
 
     [[ $RESPONSE == *"$MANUAL_CONFIG_BEGIN"* ]] || die "Missing config begin marker"
     [[ $RESPONSE == *"$MANUAL_CONFIG_END"* ]] || die "Missing config end marker"
-    RESPONSE=${RESPONSE#*"$MANUAL_CONFIG_BEGIN"$'\n'}
-    RESPONSE=${RESPONSE%"$MANUAL_CONFIG_END"$'\n'}
+    RESPONSE=${RESPONSE#*"$MANUAL_CONFIG_BEGIN"}
+    RESPONSE=${RESPONSE#$'\n'}
+    RESPONSE=${RESPONSE%"$MANUAL_CONFIG_END"}
+    RESPONSE=${RESPONSE%$'\n'}
     [[ -n "$RESPONSE" ]] || die "Server returned an empty configuration"
 }
 
